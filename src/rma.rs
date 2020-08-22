@@ -185,8 +185,9 @@ mod tests {
         let listen_port = listener.socket_addr().port();
         let mut addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         addr.set_port(listen_port);
-        let endpoint2 = worker2.create_endpoint(addr);
-        let _endpoint1 = listener.accept().await;
+        let endpoint2 = worker2.connect(addr);
+        let connection = listener.next().await;
+        let _endpoint1 = worker1.accept(connection);
 
         let mut buf1: Vec<u8> = vec![0; 0x1000];
         let mut buf2: Vec<u8> = (0..0x1000).map(|x| x as u8).collect();

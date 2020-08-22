@@ -7,10 +7,9 @@ async fn main() {
         let config = Config::default();
         let context = Context::new(&config);
         let worker = context.create_worker();
-        let endpoint = worker.create_endpoint(server_addr.parse().unwrap());
+        let endpoint = worker.connect(server_addr.parse().unwrap());
         endpoint.print_to_stderr();
         std::thread::spawn(move || loop {
-            worker.wait();
             worker.progress();
         });
 
@@ -21,12 +20,15 @@ async fn main() {
         let context = Context::new(&config);
         let worker = context.create_worker();
         let listener = worker.create_listener("0.0.0.0:10000".parse().unwrap());
-        std::thread::spawn(move || loop {
-            worker.wait();
-            worker.progress();
+        std::thread::spawn({
+            let worker = worker.clone();
+            move || loop {
+                worker.progress();
+            }
         });
         println!("listening on {}", listener.socket_addr());
-        let endpoint = listener.accept().await;
+        let connection = listener.next().await;
+        let endpoint = worker.accept(connection);
         println!("accept");
         endpoint.print_to_stderr();
 

@@ -30,7 +30,7 @@ impl UcpStream {
     pub async fn connect(addr: impl ToSocketAddrs) -> Result<UcpStream> {
         let worker = self::reactor::create_worker();
         let addr = addr.to_socket_addrs()?.next().unwrap();
-        let endpoint = worker.create_endpoint(addr);
+        let endpoint = worker.connect(addr);
         Ok(UcpStream::from(endpoint))
     }
 
@@ -117,7 +117,8 @@ impl UcpListener {
     }
 
     pub async fn accept(&self) -> Result<UcpStream> {
-        let endpoint = self.listener.accept().await;
+        let connection = self.listener.next().await;
+        let endpoint = self.listener.worker.accept(connection);
         Ok(UcpStream::from(endpoint))
     }
 
@@ -130,10 +131,8 @@ impl Stream for UcpListener {
     type Item = Result<UcpStream>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let future = self.listener.accept();
+        let future = self.accept();
         pin_mut!(future);
-        future
-            .poll(cx)
-            .map(|endpoint| Some(Ok(UcpStream::from(endpoint))))
+        future.poll(cx).map(Some)
     }
 }

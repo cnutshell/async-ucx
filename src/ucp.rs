@@ -181,8 +181,12 @@ impl Worker {
         Listener::new(self, addr)
     }
 
-    pub fn create_endpoint(self: &Arc<Self>, addr: SocketAddr) -> Arc<Endpoint> {
-        Endpoint::new(self, addr)
+    pub fn connect(self: &Arc<Self>, addr: SocketAddr) -> Arc<Endpoint> {
+        Endpoint::connect(self, addr)
+    }
+
+    pub fn accept(self: &Arc<Self>, connection: ConnectionRequest) -> Arc<Endpoint> {
+        Endpoint::accept(self, connection)
     }
 
     pub fn wait(&self) {
@@ -266,26 +270,41 @@ impl<'a> Drop for WorkerAddress<'a> {
 pub struct Listener {
     handle: ucp_listener_h,
     incomings: Mutex<Queue>,
-    worker: Arc<Worker>,
+    pub(crate) worker: Arc<Worker>,
 }
 
 #[derive(Debug, Default)]
 struct Queue {
-    items: VecDeque<Arc<Endpoint>>,
+    items: VecDeque<ConnectionRequest>,
     wakers: Vec<Waker>,
+}
+
+#[derive(Debug)]
+#[must_use = "connection must be accepted or rejected"]
+pub struct ConnectionRequest {
+    handle: ucp_conn_request_h,
+    listener: Arc<Listener>,
+}
+
+impl ConnectionRequest {
+    /// Reject the connection.
+    pub fn reject(self) {
+        let status = unsafe { ucp_listener_reject(self.listener.handle, self.handle) };
+        assert_eq!(status, ucs_status_t::UCS_OK);
+    }
 }
 
 impl Listener {
     fn new(worker: &Arc<Worker>, addr: SocketAddr) -> Arc<Self> {
-        unsafe extern "C" fn accept_handler(ep: ucp_ep_h, arg: *mut c_void) {
-            trace!("accept endpoint={:?}", ep);
+        unsafe extern "C" fn connect_handler(conn_request: ucp_conn_request_h, arg: *mut c_void) {
+            trace!("connect request={:?}", conn_request);
             let listener = ManuallyDrop::new(Arc::from_raw(arg as *const Listener));
-            let endpoint = Arc::new(Endpoint {
-                handle: ep,
-                worker: listener.worker.clone(),
-            });
+            let connection = ConnectionRequest {
+                handle: conn_request,
+                listener: (*listener).clone(),
+            };
             let mut incomings = listener.incomings.lock().unwrap();
-            incomings.items.push_back(endpoint);
+            incomings.items.push_back(connection);
             for waker in incomings.wakers.drain(..) {
                 waker.wake();
             }
@@ -299,19 +318,19 @@ impl Listener {
         let sockaddr = os_socketaddr::OsSocketAddr::from(addr);
         let params = ucp_listener_params_t {
             field_mask: (ucp_listener_params_field::UCP_LISTENER_PARAM_FIELD_SOCK_ADDR
-                | ucp_listener_params_field::UCP_LISTENER_PARAM_FIELD_ACCEPT_HANDLER)
+                | ucp_listener_params_field::UCP_LISTENER_PARAM_FIELD_CONN_HANDLER)
                 .0 as u64,
             sockaddr: ucs_sock_addr {
                 addr: sockaddr.as_ptr() as _,
                 addrlen: sockaddr.len(),
             },
             accept_handler: ucp_listener_accept_handler_t {
-                cb: Some(accept_handler),
-                arg: listener.as_ref() as *const Self as _,
-            },
-            conn_handler: ucp_listener_conn_handler_t {
                 cb: None,
                 arg: null_mut(),
+            },
+            conn_handler: ucp_listener_conn_handler_t {
+                cb: Some(connect_handler),
+                arg: listener.as_ref() as *const Self as _,
             },
         };
         let handle = &mut Arc::get_mut(&mut listener).unwrap().handle;
@@ -334,11 +353,11 @@ impl Listener {
         sockaddr.into_addr().unwrap()
     }
 
-    pub async fn accept(&self) -> Arc<Endpoint> {
+    pub async fn next(&self) -> ConnectionRequest {
         poll_fn(|cx| {
             let mut incomings = self.incomings.lock().unwrap();
-            if let Some(endpoint) = incomings.items.pop_front() {
-                Poll::Ready(endpoint)
+            if let Some(connection) = incomings.items.pop_front() {
+                Poll::Ready(connection)
             } else {
                 incomings.wakers.push(cx.waker().clone());
                 Poll::Pending
@@ -364,7 +383,7 @@ unsafe impl Send for Endpoint {}
 unsafe impl Sync for Endpoint {}
 
 impl Endpoint {
-    fn new(worker: &Arc<Worker>, addr: SocketAddr) -> Arc<Self> {
+    fn connect(worker: &Arc<Worker>, addr: SocketAddr) -> Arc<Self> {
         let sockaddr = os_socketaddr::OsSocketAddr::from(addr);
         let params = ucp_ep_params {
             field_mask: (ucp_ep_params_field::UCP_EP_PARAM_FIELD_FLAGS
@@ -375,17 +394,21 @@ impl Endpoint {
                 addr: sockaddr.as_ptr() as _,
                 addrlen: sockaddr.len(),
             },
-            // set NONE to enable TCP
-            // ref: https://github.com/rapidsai/ucx-py/issues/194#issuecomment-535726896
-            err_mode: ucp_err_handling_mode_t::UCP_ERR_HANDLING_MODE_NONE,
-            err_handler: ucp_err_handler {
-                cb: None,
-                arg: null_mut(),
-            },
-            user_data: null_mut(),
-            address: null_mut(),
-            conn_request: null_mut(),
+            ..unsafe { MaybeUninit::uninit().assume_init() }
         };
+        Endpoint::create(worker, params)
+    }
+
+    fn accept(worker: &Arc<Worker>, connection: ConnectionRequest) -> Arc<Self> {
+        let params = ucp_ep_params {
+            field_mask: ucp_ep_params_field::UCP_EP_PARAM_FIELD_CONN_REQUEST.0 as u64,
+            conn_request: connection.handle,
+            ..unsafe { MaybeUninit::uninit().assume_init() }
+        };
+        Endpoint::create(worker, params)
+    }
+
+    fn create(worker: &Arc<Worker>, params: ucp_ep_params) -> Arc<Self> {
         let mut handle = MaybeUninit::uninit();
         let status = unsafe { ucp_ep_create(worker.handle, &params, handle.as_mut_ptr()) };
         assert_eq!(status, ucs_status_t::UCS_OK);
@@ -604,17 +627,20 @@ mod tests {
         let listener = worker1.create_listener("0.0.0.0:0".parse().unwrap());
         let listen_port = listener.socket_addr().port();
 
-        std::thread::spawn(move || loop {
-            worker1.wait();
-            worker1.progress();
+        std::thread::spawn({
+            let worker1 = worker1.clone();
+            move || loop {
+                worker1.progress();
+            }
         });
         std::thread::spawn(move || {
             let worker2 = context.create_worker();
             let mut addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
             addr.set_port(listen_port);
-            let _endpoint = worker2.create_endpoint(addr);
+            let _endpoint = worker2.connect(addr);
         });
 
-        let _endpoint = listener.accept().await;
+        let connection = listener.next().await;
+        let _endpoint = worker1.accept(connection);
     }
 }
