@@ -14,6 +14,7 @@ use std::ptr::NonNull;
 use std::ptr::{null, null_mut};
 use std::sync::{Arc, Mutex};
 use std::task::{Poll, Waker};
+use tokio::sync::Mutex as AsyncMutex;
 use ucx_sys::*;
 
 #[path = "rma.rs"]
@@ -114,6 +115,7 @@ impl Drop for Context {
 pub struct Worker {
     handle: ucp_worker_h,
     context: Arc<Context>,
+    lock: AsyncMutex<()>,
 }
 
 unsafe impl Send for Worker {}
@@ -141,6 +143,7 @@ impl Worker {
         let worker = Arc::new(Worker {
             handle: unsafe { handle.assume_init() },
             context: context.clone(),
+            lock: AsyncMutex::new(()),
         });
         assert_eq!(
             worker.thread_mode(),
@@ -200,7 +203,8 @@ impl Worker {
         }
     }
 
-    pub fn progress(&self) -> u32 {
+    pub async fn progress(&self) -> u32 {
+        let _guard = self.lock.lock().await;
         unsafe { ucp_worker_progress(self.handle) }
     }
 
@@ -354,7 +358,7 @@ impl Drop for Listener {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Endpoint {
     handle: ucp_ep_h,
     worker: Arc<Worker>,
@@ -401,7 +405,7 @@ impl Endpoint {
         unsafe { ucp_ep_print_info(self.handle, stderr) };
     }
 
-    pub fn stream_send(&self, buf: &[u8]) -> RequestHandle {
+    pub async fn stream_send(self: Arc<Self>, buf: &[u8]) -> usize {
         trace!("stream_send: endpoint={:?} len={}", self.handle, buf.len());
         unsafe extern "C" fn callback(request: *mut c_void, status: ucs_status_t) {
             trace!(
@@ -413,26 +417,27 @@ impl Endpoint {
             request.waker.wake();
         }
         let status = unsafe {
-            ucp_stream_send_nb(
+            let _guard = self.worker.lock.lock().await;
+            StatusPtr(ucp_stream_send_nb(
                 self.handle,
                 buf.as_ptr() as _,
                 buf.len() as _,
                 ucp_dt_make_contig(1),
                 Some(callback),
                 0,
-            )
+            ))
         };
         if status.is_null() {
             trace!("stream_send: complete");
-            RequestHandle::Ready(buf.len())
-        } else if UCS_PTR_IS_PTR(status) {
-            RequestHandle::from(status, buf.len())
+        } else if status.is_ptr() {
+            RequestHandle::from(status).await;
         } else {
-            panic!("failed to send stream: {:?}", UCS_PTR_RAW_STATUS(status));
+            panic!("failed to send stream: {:?}", status.as_raw());
         }
+        buf.len()
     }
 
-    pub fn stream_recv(&self, buf: &mut [u8]) -> RequestHandle {
+    pub async fn stream_recv(self: Arc<Self>, buf: &mut [u8]) -> usize {
         trace!("stream_recv: endpoint={:?} len={}", self.handle, buf.len());
         unsafe extern "C" fn callback(request: *mut c_void, status: ucs_status_t, length: u64) {
             trace!(
@@ -447,7 +452,8 @@ impl Endpoint {
         }
         let mut length = MaybeUninit::uninit();
         let status = unsafe {
-            ucp_stream_recv_nb(
+            let _guard = self.worker.lock.lock().await;
+            StatusPtr(ucp_stream_recv_nb(
                 self.handle,
                 buf.as_mut_ptr() as _,
                 buf.len() as _,
@@ -455,16 +461,16 @@ impl Endpoint {
                 Some(callback),
                 length.as_mut_ptr(),
                 0,
-            )
+            ))
         };
         if status.is_null() {
             let length = unsafe { length.assume_init() } as usize;
             trace!("stream_recv: complete. len={}", length);
-            RequestHandle::Ready(length)
-        } else if UCS_PTR_IS_PTR(status) {
-            RequestHandle::from(status, 0)
+            length
+        } else if status.is_ptr() {
+            RequestHandle::from(status).await
         } else {
-            panic!("failed to recv stream: {:?}", UCS_PTR_RAW_STATUS(status));
+            panic!("failed to recv stream: {:?}", status.as_raw());
         }
     }
 
@@ -524,27 +530,37 @@ impl Request {
     }
 }
 
-/// A handle to the request returned from async IO functions.
-pub enum RequestHandle {
-    Ready(usize),
-    Pending(NonNull<Request>),
+struct StatusPtr(ucs_status_ptr_t);
+
+unsafe impl Send for StatusPtr {}
+unsafe impl Sync for StatusPtr {}
+
+impl StatusPtr {
+    fn is_null(&self) -> bool {
+        self.0.is_null()
+    }
+    fn is_ptr(&self) -> bool {
+        UCS_PTR_IS_PTR(self.0)
+    }
+    fn as_raw(&self) -> ucs_status_t {
+        UCS_PTR_RAW_STATUS(self.0)
+    }
 }
+
+/// A handle to the request returned from async IO functions.
+struct RequestHandle(NonNull<Request>);
 
 unsafe impl Send for RequestHandle {}
 
 impl RequestHandle {
-    fn from(status_ptr: ucs_status_ptr_t, len: usize) -> Self {
-        assert!(UCS_PTR_IS_PTR(status_ptr));
-        let mut ptr = NonNull::new(status_ptr as *mut Request).unwrap();
-        unsafe { ptr.as_mut() }.length = len;
-        RequestHandle::Pending(ptr)
+    fn from(status_ptr: StatusPtr) -> Self {
+        assert!(status_ptr.is_ptr());
+        let ptr = NonNull::new(status_ptr.0 as *mut Request).unwrap();
+        RequestHandle(ptr)
     }
 
     fn check_status(&self) -> ucs_status_t {
-        match self {
-            RequestHandle::Ready(_) => ucs_status_t::UCS_OK,
-            RequestHandle::Pending(ptr) => unsafe { ucp_request_check_status(ptr.as_ptr() as _) },
-        }
+        unsafe { ucp_request_check_status(self.0.as_ptr() as _) }
     }
 
     fn is_completed(&self) -> bool {
@@ -552,16 +568,11 @@ impl RequestHandle {
     }
 
     fn len(&self) -> usize {
-        match self {
-            RequestHandle::Ready(len) => *len,
-            RequestHandle::Pending(ptr) => unsafe { ptr.as_ref() }.length,
-        }
+        unsafe { self.0.as_ref() }.length
     }
 
     fn register_waker(&mut self, waker: &Waker) {
-        if let RequestHandle::Pending(ptr) = self {
-            unsafe { ptr.as_mut() }.waker.register(waker);
-        }
+        unsafe { self.0.as_mut() }.waker.register(waker);
     }
 }
 
@@ -581,10 +592,8 @@ impl Future for RequestHandle {
 
 impl Drop for RequestHandle {
     fn drop(&mut self) {
-        if let RequestHandle::Pending(ptr) = self {
-            trace!("request free: {:?}", ptr.as_ptr());
-            unsafe { ucp_request_free(ptr.as_ptr() as _) };
-        }
+        trace!("request free: {:?}", self.0.as_ptr());
+        unsafe { ucp_request_free(self.0.as_ptr() as _) };
     }
 }
 

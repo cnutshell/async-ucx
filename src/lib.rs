@@ -4,6 +4,7 @@
 extern crate log;
 
 use futures::pin_mut;
+use futures::FutureExt;
 use std::future::Future;
 use std::mem::MaybeUninit;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -22,8 +23,8 @@ pub use self::reactor::UCP_CONTEXT;
 /// A UCP stream between a local and a remote socket.
 pub struct UcpStream {
     endpoint: Arc<ucp::Endpoint>,
-    read_future: Option<ucp::RequestHandle>,
-    write_future: Option<ucp::RequestHandle>,
+    read_future: Option<Pin<Box<dyn Future<Output = usize> + Send>>>,
+    write_future: Option<Pin<Box<dyn Future<Output = usize> + Send>>>,
 }
 
 impl UcpStream {
@@ -61,11 +62,13 @@ impl AsyncRead for UcpStream {
         cx: &mut Context,
         buf: &mut [u8],
     ) -> Poll<Result<usize>> {
-        let mut future = self
-            .read_future
-            .take()
-            .unwrap_or_else(|| self.endpoint.stream_recv(buf));
-        let result = Pin::new(&mut future).poll(cx).map(Ok);
+        let mut future = self.read_future.take().unwrap_or_else(|| {
+            self.endpoint
+                .clone()
+                .stream_recv(unsafe { std::mem::transmute(buf) })
+                .boxed()
+        });
+        let result = future.as_mut().poll(cx).map(Ok);
         if result.is_pending() {
             self.read_future = Some(future);
         }
@@ -81,11 +84,13 @@ impl AsyncRead for UcpStream {
 
 impl AsyncWrite for UcpStream {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<Result<usize>> {
-        let mut future = self
-            .write_future
-            .take()
-            .unwrap_or_else(|| self.endpoint.stream_send(buf));
-        let result = Pin::new(&mut future).poll(cx).map(Ok);
+        let mut future = self.write_future.take().unwrap_or_else(|| {
+            self.endpoint
+                .clone()
+                .stream_send(unsafe { std::mem::transmute(buf) })
+                .boxed()
+        });
+        let result = future.as_mut().poll(cx).map(Ok);
         if result.is_pending() {
             self.write_future = Some(future);
         }

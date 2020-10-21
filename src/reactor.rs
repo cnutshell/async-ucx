@@ -13,7 +13,7 @@ pub fn create_worker() -> Arc<Worker> {
     // spawn a future to make progress on the worker
     tokio::spawn(async move {
         while Arc::strong_count(&worker) > 1 {
-            while worker.progress() != 0 {}
+            worker.progress().await;
             tokio::task::yield_now().await;
         }
     });

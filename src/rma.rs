@@ -101,7 +101,7 @@ impl Drop for RKey {
 }
 
 impl Endpoint {
-    pub fn put(&self, buf: &[u8], remote_addr: u64, rkey: &RKey) -> RequestHandle {
+    pub async fn put(&self, buf: &[u8], remote_addr: u64, rkey: &RKey) {
         trace!("put: endpoint={:?} len={}", self.handle, buf.len());
         unsafe extern "C" fn callback(request: *mut c_void, status: ucs_status_t) {
             trace!("put: complete. req={:?}, status={:?}", request, status);
@@ -109,26 +109,26 @@ impl Endpoint {
             request.waker.wake();
         }
         let status = unsafe {
-            ucp_put_nb(
+            let _guard = self.worker.lock.lock().await;
+            StatusPtr(ucp_put_nb(
                 self.handle,
                 buf.as_ptr() as _,
                 buf.len() as _,
                 remote_addr,
                 rkey.handle,
                 Some(callback),
-            )
+            ))
         };
         if status.is_null() {
             trace!("put: complete.");
-            RequestHandle::Ready(0)
-        } else if UCS_PTR_IS_PTR(status) {
-            RequestHandle::from(status, 0)
+        } else if status.is_ptr() {
+            RequestHandle::from(status).await;
         } else {
-            panic!("failed to put: {:?}", UCS_PTR_RAW_STATUS(status));
+            panic!("failed to put: {:?}", status.as_raw());
         }
     }
 
-    pub fn get(&self, buf: &mut [u8], remote_addr: u64, rkey: &RKey) -> RequestHandle {
+    pub async fn get(&self, buf: &mut [u8], remote_addr: u64, rkey: &RKey) {
         trace!("get: endpoint={:?} len={}", self.handle, buf.len());
         unsafe extern "C" fn callback(request: *mut c_void, status: ucs_status_t) {
             trace!("get: complete. req={:?}, status={:?}", request, status);
@@ -136,22 +136,22 @@ impl Endpoint {
             request.waker.wake();
         }
         let status = unsafe {
-            ucp_get_nb(
+            let _guard = self.worker.lock.lock().await;
+            StatusPtr(ucp_get_nb(
                 self.handle,
                 buf.as_mut_ptr() as _,
                 buf.len() as _,
                 remote_addr,
                 rkey.handle,
                 Some(callback),
-            )
+            ))
         };
         if status.is_null() {
             trace!("get: complete.");
-            RequestHandle::Ready(0)
-        } else if UCS_PTR_IS_PTR(status) {
-            RequestHandle::from(status, 0)
+        } else if status.is_ptr() {
+            RequestHandle::from(status).await;
         } else {
-            panic!("failed to get: {:?}", UCS_PTR_RAW_STATUS(status));
+            panic!("failed to get: {:?}", status.as_raw());
         }
     }
 }
