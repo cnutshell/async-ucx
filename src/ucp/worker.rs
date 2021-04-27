@@ -6,7 +6,7 @@ use std::os::unix::io::AsRawFd;
 #[derive(Debug)]
 pub struct Worker {
     pub(super) handle: ucp_worker_h,
-    context: Rc<Context>,
+    context: Arc<Context>,
 }
 
 impl Drop for Worker {
@@ -16,7 +16,7 @@ impl Drop for Worker {
 }
 
 impl Worker {
-    pub(super) fn new(context: &Rc<Context>) -> Rc<Self> {
+    pub(super) fn new(context: &Arc<Context>) -> Rc<Self> {
         let mut params = MaybeUninit::<ucp_worker_params_t>::uninit();
         unsafe { (*params.as_mut_ptr()).field_mask = 0 };
         let mut handle = MaybeUninit::uninit();
@@ -73,12 +73,16 @@ impl Worker {
         }
     }
 
-    pub fn create_listener(self: &Rc<Self>, addr: SocketAddr) -> Rc<Listener> {
+    pub fn create_listener(self: &Rc<Self>, addr: SocketAddr) -> Listener {
         Listener::new(self, addr)
     }
 
-    pub fn create_endpoint(self: &Rc<Self>, addr: SocketAddr) -> Rc<Endpoint> {
-        Endpoint::new(self, addr)
+    pub fn connect(self: &Rc<Self>, addr: SocketAddr) -> Endpoint {
+        Endpoint::connect(self, addr)
+    }
+
+    pub fn accept(self: &Rc<Self>, connection: ConnectionRequest) -> Endpoint {
+        Endpoint::accept(self, connection)
     }
 
     /// Waits (blocking) until an event has happened.
